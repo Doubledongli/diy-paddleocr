@@ -11,24 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# !flask/bin/python
+#!flask/bin/python
 # pylint: disable=doc-string-missing
-import json
 
 from flask import Flask, request, abort
 from contextlib import closing
 from multiprocessing import Pool, Process, Queue
 from paddle_serving_client import Client
-from deploy.paddle_serving_server import OpMaker, OpSeqMaker, Server
-from deploy.paddle_serving_server.serve import start_multi_card
+from deploy.paddle_serving_server_flask import OpMaker, OpSeqMaker, Server
+from deploy.paddle_serving_server_flask.serve import start_multi_card
 import socket
 import sys
 import numpy as np
 import os
-from deploy.paddle_serving_server import pipeline
-from deploy.paddle_serving_server.pipeline import Op
-
-from sanic import Sanic
+from deploy.paddle_serving_server_flask import pipeline
+from deploy.paddle_serving_server_flask.pipeline import Op
 
 
 def port_is_available(port):
@@ -160,7 +157,7 @@ class WebService(object):
             server.set_xpu()
 
         server.load_model_config(self.server_config_dir_paths
-                                 )  # brpc Server support server_config_dir_paths
+                                 )  #brpc Server support server_config_dir_paths
         if gpuid >= 0:
             server.set_gpuid(gpuid)
         server.prepare_server(workdir=workdir, port=port, device=device)
@@ -243,12 +240,11 @@ class WebService(object):
             endpoints = "127.0.0.1:{}".format(self.port_list[0])
         self.client.connect([endpoints])
 
-    async def get_prediction(self, request):
-        from sanic.response import text
+    def get_prediction(self, request):
         if not request.json:
             abort(400)
         try:
-            feed, fetch, is_batch, dt_boxes = await self.preprocess(request.json["feed"],
+            feed, fetch, is_batch, dt_boxes = self.preprocess(request.json["feed"],
                                                               ["save_infer_model/scale_0.tmp_1"])
             if isinstance(feed, dict) and "fetch" in feed:
                 del feed["fetch"]
@@ -256,32 +252,12 @@ class WebService(object):
                 raise ValueError("empty input")
             fetch_map = self.client.predict(
                 feed=feed, fetch=fetch, batch=is_batch)
-            result = await self.postprocess(
-                feed=request.json["feed"], fetch=fetch, fetch_map=fetch_map, dt_boxes=dt_boxes)
-            #result = text({"result": result, "message": "ok", "status": 200})
-            result = text(json.dumps(result))
+            result = self.postprocess(
+                feed=request.json["feed"], fetch=fetch, fetch_map=fetch_map)
+            result = {"result": result}
         except ValueError as err:
             result = {"result": str(err)}
         return result
-    def get_prediction_flask(self, request):
-        if not request.json:
-            abort(400)
-        try:
-            feed, fetch, is_batch, dt_boxes = self.preprocess_flask(request.json["feed"],
-                                                              ["save_infer_model/scale_0.tmp_1"])
-            if isinstance(feed, dict) and "fetch" in feed:
-                del feed["fetch"]
-            if len(feed) == 0:
-                raise ValueError("empty input")
-            fetch_map = self.client.predict(
-                feed=feed, fetch=fetch, batch=is_batch)
-            result =  self.postprocess_flask(
-                feed=request.json["feed"], fetch=fetch, fetch_map=fetch_map, dt_boxes=dt_boxes)
-            result = {"result": result, "message": "ok", "status": 200}
-        except ValueError as err:
-            result = {"result": str(err)}
-        return result
-
 
     def run_rpc_service(self):
         print("This API will be deprecated later. Please do not use it")
@@ -293,12 +269,12 @@ class WebService(object):
         server_pros = []
         self.create_rpc_config()
         for i, service in enumerate(self.rpc_service_list):
-            p = Process(target=self._launch_rpc_service, args=(i,))
+            p = Process(target=self._launch_rpc_service, args=(i, ))
             server_pros.append(p)
         for p in server_pros:
             p.start()
 
-        app_instance = Sanic(__name__)
+        app_instance = Flask(__name__)
 
         @app_instance.before_first_request
         def init():
@@ -307,34 +283,32 @@ class WebService(object):
         service_name = "/" + self.name + "/prediction"
 
         @app_instance.route(service_name, methods=["POST"])
-        def run(request):
+        def run():
             return self.get_prediction(request)
 
         self.app_instance = app_instance
 
     # TODO: maybe change another API name: maybe run_local_predictor?
-    async def run_debugger_service(self, gpu=False):
+    def run_debugger_service(self, gpu=True):
         print("This API will be deprecated later. Please do not use it")
         import socket
         localIP = socket.gethostbyname(socket.gethostname())
         print("web service address:")
         print("http://{}:{}/{}/prediction".format(localIP, self.port,
                                                   self.name))
+        app_instance = Flask(__name__)
 
-        # app_instance = Sanic(__name__)
-
-        # @self.app_instance.before_first_request
+        @app_instance.before_first_request
         def init():
             self._launch_local_predictor(gpu)
 
-        self._launch_local_predictor(gpu)
         service_name = "/" + self.name + "/prediction"
 
-        @self.app_instance.route(service_name, methods=["POST"])
-        async def run(request):
-            return await self.get_prediction(request)
+        @app_instance.route(service_name, methods=["POST"])
+        def run():
+            return self.get_prediction(request)
 
-        self.app_instance = self.app_instance
+        self.app_instance = app_instance
 
     def _launch_local_predictor(self, gpu):
         # actually, LocalPredictor is like a server, but it is WebService Request initiator
@@ -358,31 +332,12 @@ class WebService(object):
 
     def run_web_service(self):
         print("This API will be deprecated later. Please do not use it")
-
-        self.app_instance = Sanic(__name__)
-
-        self._launch_local_predictor(False)
-        @self.app_instance.route("/ocr/prediction", methods=["POST"])
-        async def run(request):
-            return await self.get_prediction(request)
-        # self.app_instance.add_task(self.run_debugger_service())
-        self.app_instance.run(host="0.0.0.0", port=self.port, workers=1)
-
-    def run_web_service_flask(self):
-        print("This API will be deprecated later. Please do not use it")
-        self.app_instance = Flask(__name__)
-        @self.app_instance.before_first_request
-        def init():
-            self._launch_local_predictor(False)
-        self._launch_local_predictor(False)
-        @self.app_instance.route("/ocr/prediction", methods=["POST"])
-        def run():
-            return self.get_prediction_flask(request)
         self.app_instance.run(host="0.0.0.0", port=self.port)
+
     def get_app_instance(self):
         return self.app_instance
 
-    async def preprocess(self, feed=[], fetch=[]):
+    def preprocess(self, feed=[], fetch=[]):
         print("This API will be deprecated later. Please do not use it")
         is_batch = True
         feed_dict = {}
@@ -396,29 +351,9 @@ class WebService(object):
         feed = {}
         for key in feed_dict:
             feed[key] = np.concatenate(feed_dict[key], axis=0)
-        return feed, fetch, is_batch, []
-    def preprocess_flask(self, feed=[], fetch=[]):
-        print("This API will be deprecated later. Please do not use it")
-        is_batch = True
-        feed_dict = {}
-        for var_name in self.feed_vars.keys():
-            feed_dict[var_name] = []
-        for feed_ins in feed:
-            for key in feed_ins:
-                feed_dict[key].append(
-                    np.array(feed_ins[key]).reshape(
-                        list(self.feed_vars[key].shape))[np.newaxis, :])
-        feed = {}
-        for key in feed_dict:
-            feed[key] = np.concatenate(feed_dict[key], axis=0)
-        return feed, fetch, is_batch, []
+        return feed, fetch, is_batch,[]
 
-    async def postprocess(self, feed=[], fetch=[], fetch_map=None, dt_boxes=[]):
-        print("This API will be deprecated later. Please do not use it")
-        for key in fetch_map:
-            fetch_map[key] = fetch_map[key].tolist()
-        return fetch_map
-    def postprocess_flask(self, feed=[], fetch=[], fetch_map=None, dt_boxes=[]):
+    def postprocess(self, feed=[], fetch=[], fetch_map=None):
         print("This API will be deprecated later. Please do not use it")
         for key in fetch_map:
             fetch_map[key] = fetch_map[key].tolist()
